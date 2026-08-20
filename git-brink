@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+
+set -eu
+
+VERSION="0.1.0"
+PROG="${0##*/}"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RED=$(printf '\033[31m'); C_YEL=$(printf '\033[33m')
+  C_GRN=$(printf '\033[32m'); C_DIM=$(printf '\033[2m')
+  C_BLD=$(printf '\033[1m'); C_OFF=$(printf '\033[0m')
+else
+  C_RED=; C_YEL=; C_GRN=; C_DIM=; C_BLD=; C_OFF=
+fi
+
+n_critical=0
+n_warning=0
+
+say()  { printf '%s\n' "$*"; }
+detail() { printf '          %s\n' "$*"; }
+
+critical() {
+  n_critical=$((n_critical + 1))
+  printf '%sCRITICAL%s  %s\n' "$C_RED$C_BLD" "$C_OFF" "$*"
+}
+
+warning() {
+  n_warning=$((n_warning + 1))
+  printf '%sWARN%s      %s\n' "$C_YEL$C_BLD" "$C_OFF" "$*"
+}
+
+usage() {
+  cat <<USAGE
+${PROG} ${VERSION} — show what a stray 'git add -A' would leak.
+
+Usage:
+  ${PROG} [path]          check the repository containing <path> (default: .)
+  ${PROG} --no-network    skip the remote-visibility lookup via gh
+  ${PROG} -h | --help     show this help
+  ${PROG} --version       show version
+
+Exit codes:
+  0  nothing found
+  1  warnings only
+  2  at least one critical finding
+USAGE
+}
+
+classify() {
+  path="$1"
+  base="${path##*/}"
+  [ -n "$base" ] || base=${path%/}
+
+  case $path in
+    *.example|*.example.*|*.sample|*.sample.*|*.template|*.template.*|*.dist)
+      return 1 ;;
+    *.pub)
+      return 1 ;;
+  esac
+
+  case $path in
+    .ssh/*|*/.ssh/*|.ssh/|*/.ssh/)             echo "SSH keys";              return 0 ;;
+    .gnupg/*|*/.gnupg/*|.gnupg/|*/.gnupg/)     echo "GnuPG keyring";         return 0 ;;
+    .aws/*|*/.aws/*|.aws/|*/.aws/)             echo "AWS credentials";       return 0 ;;
+    .kube/*|*/.kube/*|.kube/|*/.kube/)         echo "Kubernetes config";     return 0 ;;
+    .docker/config.json|*/.docker/config.json) echo "Docker registry auth";  return 0 ;;
+    .config/gh/*|*/.config/gh/*)               echo "GitHub CLI token";      return 0 ;;
+  esac
+
+  case $base in
+    id_rsa|id_dsa|id_ecdsa|id_ed25519)         echo "private key";           return 0 ;;
+    .env|.env.*|env.local)                     echo "environment file";      return 0 ;;
+    .netrc|_netrc)                             echo "netrc credentials";     return 0 ;;
+    .npmrc|.yarnrc|.pypirc|.gem_credentials)   echo "package registry token";return 0 ;;
+    .s3cfg)                                    echo "S3 credentials";        return 0 ;;
+    .git-credentials)                          echo "git credentials";       return 0 ;;
+    .clasprc.json)                             echo "Google apps-script token"; return 0 ;;
+    .claude.json|.claude.json.backup)          echo "Claude config";         return 0 ;;
+    credentials|credentials.*)                 echo "credentials";           return 0 ;;
+    terraform.tfstate|terraform.tfstate.*)     echo "terraform state";       return 0 ;;
+    .htpasswd)                                 echo "htpasswd";              return 0 ;;
+    *.pem|*.key|*.p12|*.pfx|*.jks|*.keystore)  echo "key material";          return 0 ;;
+    *.kdbx|*.keychain|*.keychain-db)           echo "password store";        return 0 ;;
+    *_history|.*_history)                      echo "shell/tool history";    return 0 ;;
+    *secret|*secrets|*secret.*|*secrets.*)     echo "secrets";               return 0 ;;
+    *token|*token.*|*.token)                   echo "token";                 return 0 ;;
+    *credential*)                              echo "credentials";           return 0 ;;
+  esac
+
+  return 1
+}
+
+target="."
+no_network=0
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -h|--help)    usage; exit 0 ;;
+    --version)    printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+    --no-network) no_network=1 ;;
+    --)           shift; break ;;
+    -*)           printf '%s: unknown option: %s\n' "$PROG" "$1" >&2
+                  usage >&2; exit 64 ;;
+    *)            target=$1 ;;
+  esac
+  shift
+done
+
+command -v git >/dev/null 2>&1 || {
+  printf '%s: git not found in PATH\n' "$PROG" >&2; exit 69; }
+
+[ -e "$target" ] || {
+  printf '%s: no such path: %s\n' "$PROG" "$target" >&2; exit 66; }
+
+[ -d "$target" ] || target=$(dirname "$target")
+cd "$target" || exit 66
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  printf '%s: not inside a git repository: %s\n' "$PROG" "$PWD" >&2; exit 65; }
+
+cd "$root" || exit 66
+
+remote_url=$(git config --get remote.origin.url 2>/dev/null || true)
+
+printf '%s%s%s  %s\n' "$C_BLD" "$PROG" "$C_OFF" "$root"
+[ -n "$remote_url" ] && printf '%s\n' "${C_DIM}origin: ${remote_url}${C_OFF}"
+printf '\n'
+
+home_real=${HOME%/}
+root_real=${root%/}
+
+case $root_real in
+  "$home_real")
+    critical "repository root is your home directory"
+    detail "everything under \$HOME is inside this repository's working tree"
+    ;;
+  /)
+    critical "repository root is the filesystem root"
+    ;;
+  *)
+    case $home_real in
+      "$root_real"/*)
+        critical "repository root is an ancestor of your home directory"
+        detail "root: $root_real"
+        detail "home: $home_real"
+        ;;
+    esac
+    ;;
+esac
+
+untracked_total=0
+hits=""
+hit_count=0
+budget=4000
+truncated=0
+
+record() {
+  hits="${hits}$1	$2
+"
+  hit_count=$((hit_count + 1))
+}
+
+while IFS= read -r -d '' path; do
+  untracked_total=$((untracked_total + 1))
+
+  if label=$(classify "$path"); then
+    record "$path" "$label"
+    continue
+  fi
+
+  case $path in
+    */)
+      [ "$budget" -gt 0 ] || { truncated=1; continue; }
+      while IFS= read -r -d '' inner; do
+        budget=$((budget - 1))
+        if [ "$budget" -le 0 ]; then truncated=1; break; fi
+        if label=$(classify "$inner"); then
+          record "$inner" "$label"
+        fi
+      done < <(find "${path%/}" -maxdepth 2 -type f -print0 2>/dev/null)
+      ;;
+  esac
+done < <(git ls-files --others --exclude-standard --directory --no-empty-directory -z 2>/dev/null)
+
+if [ "$hit_count" -gt 0 ]; then
+  critical "$hit_count sensitive path(s) would be staged by 'git add -A'"
+  printf '%s' "$hits" | sort | head -20 | while IFS='	' read -r p l; do
+    [ -n "$p" ] || continue
+    printf '          %-46s %s%s%s\n' "$p" "$C_DIM" "$l" "$C_OFF"
+  done
+  [ "$hit_count" -gt 20 ] && detail "... and $((hit_count - 20)) more"
+fi
+
+if [ "$truncated" -eq 1 ]; then
+  warning "scan budget exhausted — deep directories were only partially inspected"
+  detail "treat a clean result here as inconclusive"
+fi
+
+if [ ! -f "$root/.gitignore" ] && [ "$untracked_total" -gt 0 ]; then
+  warning "no .gitignore at the repository root"
+  detail "$untracked_total untracked entr$([ "$untracked_total" -eq 1 ] && echo y || echo ies) are unfiltered"
+fi
+
+nested=$(find "$root" -mindepth 2 -maxdepth 3 -name .git -not -path "$root/.git" \
+           -not -path '*/node_modules/*' 2>/dev/null | wc -l | tr -d ' ')
+
+if [ "${nested:-0}" -gt 0 ]; then
+  warning "$nested nested git repositor$([ "$nested" -eq 1 ] && echo y || echo ies) inside the working tree"
+  detail "a parent repository that swallows child repositories is usually an accident"
+fi
+
+if [ "$no_network" -eq 0 ] && [ -n "$remote_url" ] && command -v gh >/dev/null 2>&1; then
+  visibility=$(gh repo view --json visibility --jq .visibility 2>/dev/null || true)
+  if [ "$visibility" = "PUBLIC" ]; then
+    if [ "$n_critical" -gt 0 ]; then
+      critical "the remote is PUBLIC — anything pushed is world-readable and cached forever"
+    else
+      printf '%sremote visibility: PUBLIC%s\n' "$C_DIM" "$C_OFF"
+    fi
+  fi
+fi
+
+printf '\n'
+if [ "$n_critical" -gt 0 ]; then
+  printf '%s%d critical, %d warning(s).%s\n' "$C_RED" "$n_critical" "$n_warning" "$C_OFF"
+  exit 2
+elif [ "$n_warning" -gt 0 ]; then
+  printf '%s%d warning(s).%s\n' "$C_YEL" "$n_warning" "$C_OFF"
+  exit 1
+else
+  printf '%sClean. Nothing sensitive is waiting to be staged.%s\n' "$C_GRN" "$C_OFF"
+  exit 0
+fi
