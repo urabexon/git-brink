@@ -79,6 +79,15 @@ classify() {
     credentials|credentials.*)                 echo "credentials";           return 0 ;;
     terraform.tfstate|terraform.tfstate.*)     echo "terraform state";       return 0 ;;
     .htpasswd)                                 echo "htpasswd";              return 0 ;;
+    *[sS]ervice[aA]ccount*.json)               echo "GCP service account key"; return 0 ;;
+    service_account*.json|service-account*.json) echo "GCP service account key"; return 0 ;;
+    firebase-adminsdk*.json)                   echo "Firebase admin key";    return 0 ;;
+    client_secret*.json|client_secrets*.json)  echo "OAuth client secret";   return 0 ;;
+    gha-creds-*.json)                          echo "GitHub Actions creds";  return 0 ;;
+    *[kK]ey.json|*[kK]eys.json)                echo "key file";              return 0 ;;
+    *.p8|AuthKey_*.p8)                         echo "Apple auth key";        return 0 ;;
+    .pgpass|.my.cnf|.dockercfg)                echo "service credentials";   return 0 ;;
+    *.ovpn|secring.gpg)                        echo "key material";          return 0 ;;
     *.pem|*.key|*.p12|*.pfx|*.jks|*.keystore)  echo "key material";          return 0 ;;
     *.kdbx|*.keychain|*.keychain-db)           echo "password store";        return 0 ;;
     *_history|.*_history)                      echo "shell/tool history";    return 0 ;;
